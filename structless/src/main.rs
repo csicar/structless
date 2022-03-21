@@ -9,8 +9,11 @@ use std::{
 };
 
 mod delimiter;
-use clap::Parser;
+use clap::StructOpt;
 use delimiter::Delimiter;
+
+use tree_sitter::Parser;
+use tree_sitter_structless;
 
 use tui::{
     backend::CrosstermBackend,
@@ -24,7 +27,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 
-fn main() -> Result<(), io::Error> {
+fn main2() -> Result<(), io::Error> {
     // setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -55,7 +58,7 @@ fn main() -> Result<(), io::Error> {
 }
 
 /// Simple program to greet a person
-#[derive(Parser, Debug)]
+#[derive(clap::Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
     /// File to parse
@@ -67,9 +70,10 @@ struct Args {
     delimiter: Vec<Delimiter>,
 }
 
-fn main2() -> Result<(), anyhow::Error> {
+fn main() -> Result<(), anyhow::Error> {
     let args = Args::parse();
     println!("args : {:?}", &args);
+
     let mut reader: BufReader<Box<dyn Read>> = {
         if args.input == "-" {
             BufReader::new(Box::new(io::stdin()))
@@ -79,11 +83,18 @@ fn main2() -> Result<(), anyhow::Error> {
         }
     };
 
-    let mut buf = Vec::new();
-    reader.read_to_end(&mut buf)?;
-    let structure = delimit_with(&args.delimiter, buf)?;
-    let out = format_delimited(structure);
-    io::stdout().write_all(&out[..])?;
+    let language = tree_sitter_structless::language();
+
+    let mut parser = Parser::new();
+    parser.set_language(language)?;
+
+    let mut source_code = String::new();
+    reader.read_to_string(&mut source_code)?;
+
+    let tree = parser.parse(source_code, None);
+
+    // io::stdout().write_all(tree.root_node().to_sexp())?;
+    println!("{:?}", tree);
     Ok(())
 }
 
@@ -181,81 +192,3 @@ fn main2() -> Result<(), anyhow::Error> {
 
 //     todo!()
 // }
-
-fn is_delimiter_start(b: u8, delimiter: &Vec<Delimiter>) -> bool {
-    delimiter.iter().map(|d| d.start).any(|s| s == b.into())
-}
-
-fn is_delimiter_end(b: u8, delimiter: &Vec<Delimiter>) -> bool {
-    delimiter.iter().map(|d| d.end).any(|s| s == b.into())
-}
-
-fn delimit_with(
-    delimiter: &Vec<Delimiter>,
-    input: Vec<u8>,
-) -> Result<Vec<(i32, Vec<u8>)>, anyhow::Error> {
-    let mut lines = Vec::new();
-
-    let mut curr_line = Vec::new();
-    let mut indent = 0;
-
-    for byte in input {
-        if is_delimiter_start(byte, delimiter) {
-            curr_line.push(byte);
-            let l = curr_line;
-
-            lines.push((indent, l));
-            indent += 1;
-            curr_line = Vec::new();
-        } else if is_delimiter_end(byte, delimiter) {
-            let l = curr_line;
-            lines.push((indent, l));
-            indent -= 1;
-            curr_line = vec![byte];
-        } else if byte == b'\n' {
-            // skip
-        } else {
-            curr_line.push(byte);
-        }
-    }
-    lines.push((indent, curr_line.into_iter().skip_while(|&c| c == b' ').collect()));
-
-    let lines = lines.into_iter().map(|(indent, line)| {
-        let line = line.into_iter().skip_while(|&c| c == b' ').collect();
-        (indent, line)
-    }).collect();
-    Ok(lines)
-}
-
-fn format_delimited(structure: Vec<(i32, Vec<u8>)>) -> Vec<u8> {
-    let mut output = Vec::new();
-
-    for (indent, mut line) in structure {
-        for _ in 0..indent {
-            output.push(b' ');
-        }
-        output.append(&mut line);
-        output.push(b'\n');
-    }
-    output
-}
-
-mod test {
-    use super::*;
-
-    #[test]
-    fn test_delimit() -> Result<(), anyhow::Error> {
-        let input = "asd ( inner ) outer";
-        let r = delimit_with(
-            &vec![Delimiter {
-                start: '(',
-                end: ')',
-            }],
-            input.as_bytes().into(),
-        )?;
-        println!("{:#?}", r);
-        let formatted = format_delimited(r);
-        println!("{}", String::from_utf8(formatted)?);
-        Ok(())
-    }
-}
