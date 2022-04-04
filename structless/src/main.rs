@@ -1,4 +1,5 @@
 use std::{
+    cmp::{max, min},
     collections::{HashMap, HashSet},
     convert::Infallible,
     fmt::Display,
@@ -18,7 +19,7 @@ mod tree;
 
 use tracing::{error, instrument, trace};
 use tracing_subscriber::fmt::format::Writer;
-use tree_sitter::{Node, Parser, Range, Tree, TreeCursor};
+use tree_sitter::{Language, Node, Parser, Range, Tree, TreeCursor};
 use tree_sitter_structless;
 
 use crossterm::{
@@ -72,13 +73,19 @@ fn main_interactive() -> anyhow::Result<()> {
         f.render_widget(block, size);
     })?;
 
+    let language = match args.language {
+        LanguageArgument::Rust => tree_sitter_rust::language(),
+        LanguageArgument::Json => tree_sitter_json::language(),
+        LanguageArgument::Unknown => tree_sitter_structless::language(),
+    };
+
     // create app and run it
-    let mut app = App::new(source_code)?;
+    let app = App::new(source_code, language)?;
     let tree = app.tree.clone();
     let node = tree.root_node();
     // let tree =.root_node();
     node.walk();
-    let res = run_app(&mut terminal, app);
+    run_app(&mut terminal, app)?;
 
     // restore terminal
     disable_raw_mode()?;
@@ -92,12 +99,20 @@ fn main_interactive() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ViewMode {
+    Tree,
+    Text,
+}
+
+#[derive(Debug)]
 enum InputMode {
     Normal,
     Editing,
 }
 
 /// App holds the state of the application
+#[derive(Debug)]
 struct App {
     /// Current value of the input box
     input: String,
@@ -106,38 +121,51 @@ struct App {
     /// History of recorded messages
     tree: Arc<Tree>,
     source_code: String,
+
+    /// Tree controls
     collapsed: HashSet<usize>,
-    cursor: usize,
+    line_index: usize,
     list_state: ListState,
+    view_mode: ViewMode,
 }
 
 impl App {
-    pub(crate) fn new(source_code: String) -> anyhow::Result<App> {
-        let language = tree_sitter_structless::language();
-
+    pub(crate) fn new(source_code: String, language: Language) -> anyhow::Result<App> {
         let mut parser = Parser::new();
         parser.set_language(language)?;
 
         let tree = Arc::new(parser.parse(&source_code, None).unwrap());
-        let cursor = tree.root_node().id();
+        // let cursor = tree.root_node().id();
         Ok(App {
             input: "".to_string(),
             input_mode: InputMode::Normal,
             tree,
             source_code,
             collapsed: HashSet::new(),
-            cursor,
+            line_index: 0,
             list_state: ListState::default(),
+            view_mode: ViewMode::Tree,
         })
     }
 }
 
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<()> {
-    let tmp_tree = app.tree.clone();
-    let mut tree_cursor = tmp_tree.root_node().walk();
+    let mut f = flatten(app.tree.root_node(), 0, Arc::new(|id| false));
+
+    f.iter().for_each(|l| {
+        app.collapsed.insert(l.node.id());
+    });
+    drop(f);
 
     loop {
         terminal.draw(|f| ui(f, &mut app))?;
+
+        let flat_lines = flatten(
+            app.tree.root_node(),
+            0,
+            Arc::new(|id| app.collapsed.contains(&id)),
+        );
+        let selected_node = flat_lines[app.line_index].node.id();
 
         if let Event::Key(key) = event::read()? {
             match app.input_mode {
@@ -148,34 +176,24 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                     KeyCode::Char('q') => {
                         return Ok(());
                     }
-                    KeyCode::Down => {
-                        let flat_lines = flatten(app.tree.root_node(), 0, Arc::new(|id| {
-                            app.collapsed.contains(&id)
-                        }));
-                    
-                        let next = flat_lines.iter().skip_while(|line| {
-                            line.node.id() != app.cursor
-                        }).skip(1).next().map(|line| line.node.id());
-                        app.cursor = next.unwrap_or(app.cursor);
+                    KeyCode::Down | KeyCode::Char('s') => {
+                        app.line_index = min(app.line_index + 1, flat_lines.len() - 1);
                     }
-                    KeyCode::Up => {
-                        tree_cursor.goto_next_sibling();
-                        app.cursor = tree_cursor.node().id();
+                    KeyCode::Up | KeyCode::Char('w') => {
+                        app.line_index = max(app.line_index, 1) - 1;
                     }
-                    KeyCode::Right => {
-                        tree_cursor.goto_first_child();
-                        app.cursor = tree_cursor.node().id();
+                    KeyCode::Right | KeyCode::Char('d') => {
+                        app.collapsed.remove(&selected_node);
                     }
-                    KeyCode::Left => {
-                        tree_cursor.goto_parent();
-                        app.cursor = tree_cursor.node().id();
+                    KeyCode::Left | KeyCode::Char('a') => {
+                        app.collapsed.insert(selected_node);
                     }
-                    KeyCode::Char(' ') => {
-                        if app.collapsed.contains(&app.cursor) {
-                            app.collapsed.remove(&app.cursor);
+                    KeyCode::Enter => {
+                        app.view_mode = if app.view_mode == ViewMode::Text {
+                            ViewMode::Tree
                         } else {
-                            app.collapsed.insert(app.cursor);
-                        }
+                            ViewMode::Text
+                        };
                     }
                     _ => {}
                 },
@@ -196,6 +214,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                 },
             }
         }
+        trace!(?app, "new state: ");
     }
 }
 
@@ -247,7 +266,7 @@ where
     F: Fn(usize) -> bool,
 {
     use LineKind::*;
-    if should_collapse(node.id()) {
+    if should_collapse(node.id()) || node.child_count() == 0 {
         vec![Line {
             node,
             indent,
@@ -273,6 +292,15 @@ where
     }
 }
 
+fn trim_string(s: &str, max_length: usize) -> String {
+    if (s.len() > max_length) {
+        let trimmed = &s[0..max_length - 1];
+        format!("{}…", trimmed)
+    } else {
+        " ".repeat(max_length - s.len()) + s
+    }
+}
+
 fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -295,6 +323,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
                 Span::raw(" to exit, "),
                 Span::styled("e", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(" to start editing."),
+                Span::raw(format!("{}", app.line_index)),
             ],
             Style::default().add_modifier(Modifier::RAPID_BLINK),
         ),
@@ -330,24 +359,12 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
             // Make the cursor visible and ask tui-rs to put it at the specified coordinates after rendering
             f.set_cursor(
                 // Put cursor past the end of the input text
-                chunks[2].x + app.input.width() as u16 + 1,
+                chunks[1].x + app.input.width() as u16 + 1,
                 // Move one line down, from the border to the input line
-                chunks[2].y + 1,
+                chunks[1].y + 1,
             )
         }
     }
-
-    // let messages: Vec<ListItem> = app
-    //     .messages
-    //     .iter()
-    //     .enumerate()
-    //     .map(|(i, m)| {
-    //         let content = vec![Spans::from(Span::raw(format!("{}: {}", i, m)))];
-    //         ListItem::new(content)
-    //     })
-    //     .collect();
-    // let messages =
-    //     List::new(messages).block(Block::default().borders(Borders::ALL).title("Messages"));
 
     let node_start = app.tree.root_node().byte_range().start;
     let child_range = get_smaller_child_range(&app.tree.root_node())
@@ -356,95 +373,97 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
     let r = &app.source_code[node_start..child_range];
     trace!("{}, {}, {}", r, node_start, child_range);
 
-    let flat_lines = flatten(app.tree.root_node(), 0, Arc::new(|id| {
-        app.collapsed.contains(&id)
-    }));
+    let flat_lines = flatten(
+        app.tree.root_node(),
+        0,
+        Arc::new(|id| app.collapsed.contains(&id)),
+    );
 
-    flat_lines.iter().enumerate().for_each(|(index, line)| {
-        if line.node.id() == app.cursor && line.kind == LineKind::Start {
-            app.list_state.select(Some(index));
+    app.list_state.select(Some(app.line_index));
+
+    match app.view_mode {
+        ViewMode::Tree => {
+            let items: Vec<_> = flat_lines
+                .iter()
+                .map(|line| {
+                    let start = line.node.start_byte();
+                    let end = line.node.end_byte();
+                    let node_selected = line.node.id() == flat_lines[app.line_index].node.id();
+
+                    if line.kind == LineKind::End {
+                        ListItem::new(Spans::from(vec![Span::styled(
+                            format!("{}// end {}", " ".repeat(line.indent), line.node.kind()),
+                            if node_selected {
+                                Style::default().fg(Color::Red)
+                            } else {
+                                Style::default().fg(Color::DarkGray)
+                            },
+                        )]))
+                    } else {
+                        ListItem::new(Spans::from(vec![
+                            Span::raw(" ".repeat(line.indent)),
+                            Span::styled(
+                                trim_string(line.node.kind(), 15),
+                                Style::default().fg(Color::DarkGray).add_modifier(
+                                    if node_selected {
+                                        Modifier::empty()
+                                    } else {
+                                        Modifier::DIM
+                                    },
+                                ),
+                            ),
+                            Span::raw("   "),
+                            Span::styled(
+                                app.source_code[start..end].to_string(),
+                                Style::default().fg(Color::Cyan),
+                            ),
+                        ]))
+                    }
+                })
+                .collect();
+            let list = List::new(items)
+                .block(Block::default().title("Tree").borders(Borders::ALL))
+                .style(Style::default().fg(Color::White))
+                .highlight_style(
+                    Style::default()
+                        .add_modifier(Modifier::ITALIC)
+                        .bg(Color::Rgb(30, 30, 30)),
+                )
+                .highlight_symbol(">>");
+            f.render_stateful_widget(list, chunks[2], &mut app.list_state);
         }
-    });
+        ViewMode::Text => {
+            let block = Block::default().borders(Borders::ALL);
+            let selected_node = flat_lines[app.line_index].node;
+            let range = selected_node.start_byte()..selected_node.end_byte();
 
-    let items: Vec<_> = flat_lines
-        .iter()
-        .map(|line| {
-            let start = line.node.start_byte();
-            let end = line.node.end_byte();
-            ListItem::new(Spans::from(vec![
-                Span::raw(format!("{}{:?}", "  ".repeat(line.indent), line.node)),
-                Span::raw("   "),
-                Span::styled(
-                    app.source_code[start..end].to_string(),
-                    Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
-                ),
-            ]))
-        })
-        .collect();
-    // let items = [
-    //     ListItem::new(r),
-    //     ListItem::new("Item 2"),
-    //     ListItem::new("Item 3"),
-    // ];
-    let list = List::new(items)
-        .block(Block::default().title("List").borders(Borders::ALL))
-        .style(Style::default().fg(Color::White))
-        .highlight_style(Style::default().add_modifier(Modifier::ITALIC))
-        .highlight_symbol(">>");
-    f.render_stateful_widget(list, chunks[2], &mut app.list_state);
-
-    // let spans: Vec<Spans> = vec![
-    //     Span::raw("This is a line \n").into(),
-    //     Span::styled("This is a line   \n", Style::default().fg(Color::Red)).into(),
-    //     Span::styled("This is a line\n", Style::default().bg(Color::Blue)).into(),
-    // ]
-    // .into();
-
-    // let block = Block::default().borders(Borders::ALL);
-
-    // let paragraph = Paragraph::new(Text::from(spans))
-    //     .block(block.clone().title("Center, wrap"))
-    //     .alignment(Alignment::Center)
-    //     .wrap(Wrap { trim: false })
-    //     .scroll((0, 0));
-    // f.render_widget(paragraph, chunks[2]);
+            let paragraph = Paragraph::new(Text::raw(app.source_code[range].to_string()))
+                .block(block.clone().title("Source Code"))
+                .wrap(Wrap { trim: false })
+                .scroll((0, 0));
+            f.render_widget(paragraph, chunks[2]);
+        }
+    }
 }
 
-/// Simple program to greet a person
+/// Structure-Aware Less
 #[derive(clap::Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
     /// File to parse
     #[clap(short, long, value_hint=clap::ValueHint::FilePath)]
     input: String,
+
+    /// Language to use for parsing the file
+    #[clap(arg_enum, default_value = "unknown")]
+    language: LanguageArgument,
 }
 
-fn main_parse() -> Result<(), anyhow::Error> {
-    let args = Args::parse();
-    println!("args : {:?}", &args);
-
-    let mut reader: BufReader<Box<dyn Read>> = {
-        if args.input == "-" {
-            BufReader::new(Box::new(io::stdin()))
-        } else {
-            let f = File::open(args.input)?;
-            BufReader::new(Box::new(f))
-        }
-    };
-
-    let language = tree_sitter_structless::language();
-
-    let mut parser = Parser::new();
-    parser.set_language(language)?;
-
-    let mut source_code = String::new();
-    reader.read_to_string(&mut source_code)?;
-
-    let tree = parser.parse(source_code, None).unwrap();
-
-    // io::stdout().write_all(tree.root_node().to_sexp())?;
-    println!("{:?}", tree.root_node().to_sexp());
-    Ok(())
+#[derive(clap::ArgEnum, Clone, Debug)]
+enum LanguageArgument {
+    Rust,
+    Json,
+    Unknown,
 }
 
 fn main() -> Result<(), anyhow::Error> {

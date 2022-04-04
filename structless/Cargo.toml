@@ -11,6 +11,8 @@ anyhow="*"
 tree-sitter="*"
 tui="*"
 crossterm="*"
+tree-sitter-rust = "0.20"
+tree-sitter-json = "0.19"
 tree-sitter-structless={ path = "../tree-sitter-structless" }
 unicode-width="*"
 tracing="*"
