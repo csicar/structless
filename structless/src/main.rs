@@ -115,7 +115,7 @@ enum InputMode {
 #[derive(Debug)]
 struct App {
     /// Current value of the input box
-    input: String,
+    search_term: String,
     /// Current input mode
     input_mode: InputMode,
     /// History of recorded messages
@@ -137,7 +137,7 @@ impl App {
         let tree = Arc::new(parser.parse(&source_code, None).unwrap());
         // let cursor = tree.root_node().id();
         Ok(App {
-            input: "".to_string(),
+            search_term: "".to_string(),
             input_mode: InputMode::Normal,
             tree,
             source_code,
@@ -170,7 +170,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
         if let Event::Key(key) = event::read()? {
             match app.input_mode {
                 InputMode::Normal => match key.code {
-                    KeyCode::Char('e') => {
+                    KeyCode::Char('/') => {
                         app.input_mode = InputMode::Editing;
                     }
                     KeyCode::Char('q') => {
@@ -183,10 +183,28 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                         app.line_index = max(app.line_index, 1) - 1;
                     }
                     KeyCode::Right | KeyCode::Char('d') => {
-                        app.collapsed.remove(&selected_node);
+                        // already expanded ? => expand children
+                        if !app.collapsed.contains(&selected_node) {
+                            get_node_decedents(&flat_lines[app.line_index].node)
+                                .iter()
+                                .for_each(|decedent| {
+                                    app.collapsed.remove(&decedent.id());
+                                })
+                        } else {
+                            app.collapsed.remove(&selected_node);
+                        }
                     }
                     KeyCode::Left | KeyCode::Char('a') => {
-                        app.collapsed.insert(selected_node);
+                        // already collapsed ? => collapse children
+                        if app.collapsed.contains(&selected_node) {
+                            get_node_decedents(&flat_lines[app.line_index].node)
+                                .iter()
+                                .for_each(|decedent| {
+                                    app.collapsed.insert(decedent.id());
+                                })
+                        } else {
+                            app.collapsed.insert(selected_node);
+                        }
                     }
                     KeyCode::Enter => {
                         app.view_mode = if app.view_mode == ViewMode::Text {
@@ -202,10 +220,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                         // app.messages.push(app.input.drain(..).collect());
                     }
                     KeyCode::Char(c) => {
-                        app.input.push(c);
+                        app.search_term.push(c);
                     }
                     KeyCode::Backspace => {
-                        app.input.pop();
+                        app.search_term.pop();
                     }
                     KeyCode::Esc => {
                         app.input_mode = InputMode::Normal;
@@ -216,6 +234,15 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
         }
         trace!(?app, "new state: ");
     }
+}
+
+fn get_node_decedents<'a, 'b>(node: &'b Node<'a>) -> Vec<Node<'a>> {
+    let mut cursor = node.walk();
+
+    node.children(&mut cursor)
+        .into_iter()
+        .flat_map(|child| get_node_decedents(&child).into_iter().chain([child]))
+        .collect()
 }
 
 /// Gets the range of the first child node, that is actually smaller than
@@ -321,8 +348,8 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
                 Span::raw("Press "),
                 Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(" to exit, "),
-                Span::styled("e", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(" to start editing."),
+                Span::styled("/", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" to search."),
                 Span::raw(format!("{}", app.line_index)),
             ],
             Style::default().add_modifier(Modifier::RAPID_BLINK),
@@ -343,7 +370,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
     let help_message = Paragraph::new(text);
     f.render_widget(help_message, chunks[0]);
 
-    let input = Paragraph::new(app.input.as_ref())
+    let input = Paragraph::new(app.search_term.as_ref())
         .style(match app.input_mode {
             InputMode::Normal => Style::default(),
             InputMode::Editing => Style::default().fg(Color::Yellow),
@@ -359,7 +386,7 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
             // Make the cursor visible and ask tui-rs to put it at the specified coordinates after rendering
             f.set_cursor(
                 // Put cursor past the end of the input text
-                chunks[1].x + app.input.width() as u16 + 1,
+                chunks[1].x + app.search_term.width() as u16 + 1,
                 // Move one line down, from the border to the input line
                 chunks[1].y + 1,
             )
@@ -385,6 +412,16 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &mut App) {
         ViewMode::Tree => {
             let items: Vec<_> = flat_lines
                 .iter()
+                .filter(|line| {
+                    if app.search_term.is_empty() {
+                        true
+                    } else {
+                        line.node
+                            .utf8_text(app.source_code.as_bytes())
+                            .unwrap()
+                            .contains(&app.search_term)
+                    }
+                })
                 .map(|line| {
                     let start = line.node.start_byte();
                     let end = line.node.end_byte();
